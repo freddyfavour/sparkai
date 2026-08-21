@@ -126,6 +126,38 @@ export const SparkChat: React.FC<SparkChatProps> = ({
     }
   };
 
+  // Helper to parse Markdown **bold** and *italic* into bolded HTML elements
+  const renderFormattedText = (text: string) => {
+    return text.split('\n').map((line, lineIdx) => {
+      if (!line.trim()) return <div key={lineIdx} className="h-1.5" />;
+
+      // Regex split for **bold** and *italic*
+      const parts = line.split(/(\*\*.*?\*\*|\*.*?\*)/g);
+
+      return (
+        <p key={lineIdx} className="leading-relaxed">
+          {parts.map((part, partIdx) => {
+            if (part.startsWith('**') && part.endsWith('**')) {
+              return (
+                <strong key={partIdx} className="font-bold text-zinc-950 dark:text-white">
+                  {part.slice(2, -2)}
+                </strong>
+              );
+            }
+            if (part.startsWith('*') && part.endsWith('*')) {
+              return (
+                <em key={partIdx} className="italic text-zinc-800 dark:text-zinc-200">
+                  {part.slice(1, -1)}
+                </em>
+              );
+            }
+            return part;
+          })}
+        </p>
+      );
+    });
+  };
+
   const quickPrompts = [
     'Is my home 100% safe right now?',
     'Spark, wetin dey happen for kitchen?',
@@ -223,11 +255,9 @@ export const SparkChat: React.FC<SparkChatProps> = ({
                 <span className="font-mono text-[10px] text-zinc-400 dark:text-zinc-500" suppressHydrationWarning>{msg.timestamp}</span>
               </div>
 
-              {/* Message Text formatted with basic line breaks */}
-              <div className="whitespace-pre-wrap leading-relaxed space-y-1">
-                {msg.text.split('\n').map((line, idx) => (
-                  <p key={idx}>{line}</p>
-                ))}
+              {/* Formatted Message Text with Bolded Words */}
+              <div className="space-y-1">
+                {renderFormattedText(msg.text)}
               </div>
 
               {/* Attached Evidence Card */}
