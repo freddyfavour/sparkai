@@ -57,6 +57,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // Authoritative hardware connection check directly from Blynk Cloud
     if (isConnectedRes.status === 'fulfilled' && isConnectedRes.value.ok) {
       try {
         const connText = await isConnectedRes.value.text();
@@ -64,15 +65,6 @@ export async function GET(request: NextRequest) {
       } catch (err) {
         console.warn('Failed to parse Blynk isHardwareConnected response:', err);
       }
-    }
-
-    // If hardware is returning real datastream numbers, consider it ACTIVE & CONNECTED
-    const hasActiveTelemetry = Object.keys(getAllData).length > 0 && (
-      getAllData.v0 !== undefined || getAllData.v1 !== undefined || getAllData.v2 !== undefined
-    );
-
-    if (hasActiveTelemetry) {
-      isHardwareConnected = true;
     }
 
     const tempVal = getAllData[tempPin] !== undefined ? Number(getAllData[tempPin]) : getAllData.v0 !== undefined ? Number(getAllData.v0) : undefined;
@@ -88,7 +80,7 @@ export async function GET(request: NextRequest) {
           v2: gasVal,
           v3: getAllData.v3 !== undefined ? Number(getAllData.v3) : undefined,
           v4: getAllData.v4 !== undefined ? Number(getAllData.v4) : undefined,
-          isHardwareConnected,
+          isHardwareConnected, // 100% accurate real hardware connection status from Blynk!
           timestamp: new Date().toISOString(),
           rawBlynkResponse: getAllData,
         },

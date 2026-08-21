@@ -2,15 +2,8 @@
 
 import React, { useState, useEffect } from 'react';
 import { SensorMetrics } from '@/lib/sensorEngine';
-import { Activity, Clock, Flame, Thermometer, Wind, Droplets } from 'lucide-react';
-
-interface DataPoint {
-  time: string;
-  temp: number;
-  gas: number;
-  humidity: number;
-  anomaly?: boolean;
-}
+import { saveTelemetrySnapshot, getSavedTelemetryHistory, TelemetryPoint } from '@/lib/supabaseClient';
+import { Activity, Clock, Flame, Thermometer, Wind, Droplets, ZoomIn, Maximize, Database } from 'lucide-react';
 
 interface AnalyticsDashboardProps {
   currentMetrics: SensorMetrics;
@@ -18,59 +11,53 @@ interface AnalyticsDashboardProps {
 
 export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentMetrics }) => {
   const [activeTab, setActiveTab] = useState<'all' | 'temp' | 'gas' | 'humidity'>('all');
-  const [hoveredPoint, setHoveredPoint] = useState<{ point: DataPoint; key: 'temp' | 'gas' | 'humidity'; x: number; y: number } | null>(null);
+  const [zoomMode, setZoomMode] = useState<'auto' | 'full'>('auto'); // 'auto' zooms tightly to reveal real micro-fluctuations
+  const [hoveredPoint, setHoveredPoint] = useState<{ point: TelemetryPoint; key: 'temp' | 'gas' | 'humidity'; x: number; y: number } | null>(null);
 
-  // Live historical telemetry buffer
-  const [history, setHistory] = useState<DataPoint[]>([]);
+  // Real persisted historical telemetry buffer
+  const [history, setHistory] = useState<TelemetryPoint[]>([]);
 
+  // On initial mount, load real saved historical telemetry
+  useEffect(() => {
+    const saved = getSavedTelemetryHistory();
+    if (saved.length > 0) {
+      setHistory(saved);
+    }
+  }, []);
+
+  // Update history buffer ONLY when real Blynk sensor data arrives
   useEffect(() => {
     if (currentMetrics.temperature === null && currentMetrics.gas === null && currentMetrics.humidity === null) {
       return;
     }
 
     const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const newPt: DataPoint = {
+    const liveTemp = currentMetrics.temperature ?? 25.0;
+    const liveGas = currentMetrics.gas ?? 140;
+    const liveHum = currentMetrics.humidity ?? 50.0;
+
+    const newPt: TelemetryPoint = {
       time: nowStr,
-      temp: currentMetrics.temperature ?? 25.0,
-      gas: currentMetrics.gas ?? 140,
-      humidity: currentMetrics.humidity ?? 50.0,
-      anomaly: (currentMetrics.gas ?? 0) >= 400 || (currentMetrics.temperature ?? 0) >= 40 || (currentMetrics.humidity ?? 0) >= 75,
+      temp: liveTemp,
+      gas: liveGas,
+      humidity: liveHum,
+      anomaly: liveGas >= 400 || liveTemp >= 40 || liveHum >= 75,
     };
 
-    setHistory((prev) => {
-      // If history is empty, populate a smooth 10-point initial trend leading up to current live reading
-      if (prev.length === 0) {
-        const initial: DataPoint[] = [];
-        const baseTemp = newPt.temp;
-        const baseGas = newPt.gas;
-        const baseHum = newPt.humidity;
-
-        for (let i = 9; i >= 1; i--) {
-          const d = new Date(Date.now() - i * 15 * 1000);
-          initial.push({
-            time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-            temp: Number(baseTemp.toFixed(1)),
-            gas: baseGas,
-            humidity: Number(baseHum.toFixed(1)),
-            anomaly: baseGas >= 400 || baseTemp >= 40 || baseHum >= 75,
-          });
-        }
-        initial.push(newPt);
-        return initial;
-      }
-
-      // Avoid adding duplicate timestamps if metrics haven't updated
-      if (prev.length > 0 && prev[prev.length - 1].time === nowStr) {
-        return prev;
-      }
-
-      const updated = [...prev, newPt];
-      if (updated.length > 20) updated.shift(); // Keep last 20 readings for responsive fit
-      return updated;
-    });
+    // Save real hardware point to local storage & Supabase
+    const updatedHistory = saveTelemetrySnapshot(newPt);
+    if (updatedHistory && updatedHistory.length > 0) {
+      setHistory([...updatedHistory]);
+    } else {
+      setHistory((prev) => {
+        if (prev.length > 0 && prev[prev.length - 1].time === nowStr) return prev;
+        const list = [...prev, newPt];
+        return list.slice(-30);
+      });
+    }
   }, [currentMetrics.lastUpdated, currentMetrics.temperature, currentMetrics.gas, currentMetrics.humidity]);
 
-  // Calculate statistics from actual history
+  // Calculate statistics from actual real history
   const temps = history.map((h) => h.temp);
   const gases = history.map((h) => h.gas);
   const hums = history.map((h) => h.humidity);
@@ -85,6 +72,22 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
   const paddingLeft = 45; // Space for y-axis numbers
   const graphWidth = chartWidth - paddingLeft;
 
+  // Helper to generate smooth cubic Bezier path string
+  const getSmoothPath = (points: { x: number; y: number }[]) => {
+    if (points.length < 2) return '';
+    let d = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[i];
+      const p1 = points[i + 1];
+      const cp1x = (p0.x + p1.x) / 2;
+      const cp1y = p0.y;
+      const cp2x = (p0.x + p1.x) / 2;
+      const cp2y = p1.y;
+      d += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p1.x.toFixed(1)},${p1.y.toFixed(1)}`;
+    }
+    return d;
+  };
+
   const renderSVGChart = (
     dataKey: 'temp' | 'gas' | 'humidity',
     strokeColor: string,
@@ -94,8 +97,10 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
   ) => {
     if (history.length < 2) {
       return (
-        <div className="flex h-36 items-center justify-center font-mono text-xs text-zinc-400">
-          Accumulating live hardware data points...
+        <div className="flex h-36 flex-col items-center justify-center space-y-2 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/30 font-mono text-xs text-zinc-500">
+          <Database className="h-5 w-5 text-emerald-500 animate-pulse" />
+          <span>Recording real hardware telemetry from ESP32...</span>
+          <span className="text-[10px] text-zinc-400">1st reading captured ({history[0]?.temp ?? '--'}°C). Waiting for next 5s poll.</span>
         </div>
       );
     }
@@ -104,61 +109,67 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
     const rawMin = Math.min(...values);
     const rawMax = Math.max(...values);
 
-    // Auto-fit dynamic scale to actual data range with padding
     let minVal = rawMin;
     let maxVal = rawMax;
 
-    if (minVal === maxVal) {
-      minVal = Math.max(0, minVal - 5);
-      maxVal = maxVal + 5;
+    if (zoomMode === 'auto') {
+      // AUTO-FIT DATA: Auto-zooms scale to actual min/max range so even 0.1°C shifts produce clear wave curves
+      if (minVal === maxVal) {
+        minVal = Math.max(0, Number((minVal - 0.5).toFixed(1)));
+        maxVal = Number((maxVal + 0.5).toFixed(1));
+      } else {
+        const diff = maxVal - minVal;
+        const pad = Math.max(0.1, diff * 0.15);
+        minVal = Math.max(0, Number((minVal - pad).toFixed(1)));
+        maxVal = Number((maxVal + pad).toFixed(1));
+      }
     } else {
-      const padding = (maxVal - minVal) * 0.15;
-      minVal = Math.max(0, Number((minVal - padding).toFixed(1)));
-      maxVal = Number((maxVal + padding).toFixed(1));
-    }
-
-    // Include threshold line in scale if specified
-    if (thresholdValue !== undefined) {
-      if (thresholdValue > maxVal) maxVal = thresholdValue + (maxVal - minVal) * 0.1;
-      if (thresholdValue < minVal) minVal = Math.max(0, thresholdValue - (maxVal - minVal) * 0.1);
+      // FULL RANGE: Scales out to show global safety threshold limits
+      if (thresholdValue !== undefined) {
+        if (thresholdValue > maxVal) maxVal = thresholdValue + 5;
+        if (thresholdValue < minVal) minVal = Math.max(0, thresholdValue - 5);
+      }
+      const diff = maxVal - minVal;
+      const pad = diff * 0.1;
+      minVal = Math.max(0, Number((minVal - pad).toFixed(1)));
+      maxVal = Number((maxVal + pad).toFixed(1));
     }
 
     const valRange = maxVal - minVal || 1;
 
-    // Convert data points to SVG coordinates
-    const pointsWithCoords = history.map((h, i) => {
+    // Convert real data points to coordinates
+    const coords = history.map((h, i) => {
       const x = paddingLeft + (i / (history.length - 1)) * graphWidth;
       const y = chartHeight - ((h[dataKey] - minVal) / valRange) * chartHeight;
       return { x, y, point: h };
     });
 
-    const pathString = `M ${pointsWithCoords.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L ')}`;
-    const areaString = `M ${paddingLeft},${chartHeight} L ${pointsWithCoords.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L ')} L ${chartWidth},${chartHeight} Z`;
+    const smoothPath = getSmoothPath(coords);
+    const areaPath = `${smoothPath} L ${coords[coords.length - 1].x.toFixed(1)},${chartHeight} L ${paddingLeft},${chartHeight} Z`;
 
-    // Threshold Y position
+    // Threshold Line Y position
     const thresholdY = thresholdValue !== undefined
       ? chartHeight - ((thresholdValue - minVal) / valRange) * chartHeight
       : null;
 
-    // Mid Y-axis value
     const midVal = ((minVal + maxVal) / 2).toFixed(1);
 
     return (
       <div className="relative w-full">
         <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="w-full h-44 overflow-visible font-mono text-[10px]">
           
-          {/* Y-Axis Label Values */}
-          <text x="0" y="12" fill="currentColor" className="text-zinc-500 fill-current text-[10px]">
+          {/* Y-Axis Scale Values */}
+          <text x="0" y="12" fill="currentColor" className="text-zinc-500 font-bold fill-current text-[10px]">
             {dataKey === 'gas' ? Math.round(maxVal) : maxVal}{unit}
           </text>
           <text x="0" y={chartHeight / 2 + 3} fill="currentColor" className="text-zinc-500 fill-current text-[10px]">
             {dataKey === 'gas' ? Math.round(Number(midVal)) : midVal}{unit}
           </text>
-          <text x="0" y={chartHeight - 4} fill="currentColor" className="text-zinc-500 fill-current text-[10px]">
+          <text x="0" y={chartHeight - 4} fill="currentColor" className="text-zinc-500 font-bold fill-current text-[10px]">
             {dataKey === 'gas' ? Math.round(minVal) : minVal}{unit}
           </text>
 
-          {/* Gridlines */}
+          {/* Background Grid Lines */}
           <line x1={paddingLeft} y1="5" x2={chartWidth} y2="5" stroke="currentColor" className="text-zinc-200 dark:text-zinc-800/80" strokeDasharray="3 3" />
           <line x1={paddingLeft} y1={chartHeight / 2} x2={chartWidth} y2={chartHeight / 2} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800/80" strokeDasharray="3 3" />
           <line x1={paddingLeft} y1={chartHeight - 5} x2={chartWidth} y2={chartHeight - 5} stroke="currentColor" className="text-zinc-200 dark:text-zinc-800/80" strokeDasharray="3 3" />
@@ -175,25 +186,25 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
                 strokeWidth="1.5"
                 strokeDasharray="4 4"
               />
-              <text x={chartWidth - 110} y={thresholdY - 4} fill="#ef4444" className="font-bold text-[9px] fill-current">
-                {thresholdLabel || `Threshold: ${thresholdValue}${unit}`}
+              <text x={chartWidth - 120} y={thresholdY - 4} fill="#ef4444" className="font-bold text-[9px] fill-current">
+                {thresholdLabel || `Limit: ${thresholdValue}${unit}`}
               </text>
             </g>
           )}
 
-          {/* Area Gradient Fill */}
+          {/* Gradient Fill */}
           <defs>
             <linearGradient id={`grad-${dataKey}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={strokeColor} stopOpacity="0.3" />
+              <stop offset="0%" stopColor={strokeColor} stopOpacity="0.35" />
               <stop offset="100%" stopColor={strokeColor} stopOpacity="0.0" />
             </linearGradient>
           </defs>
 
-          <path d={areaString} fill={`url(#grad-${dataKey})`} />
-          <path d={pathString} fill="none" stroke={strokeColor} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path d={areaPath} fill={`url(#grad-${dataKey})`} />
+          <path d={smoothPath} fill="none" stroke={strokeColor} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
 
-          {/* Interactive Data Points */}
-          {pointsWithCoords.map((p, i) => {
+          {/* Data Points */}
+          {coords.map((p, i) => {
             const val = p.point[dataKey];
             const isAbnormal = (dataKey === 'gas' && val >= 400) || (dataKey === 'temp' && val >= 40) || (dataKey === 'humidity' && val >= 75);
 
@@ -246,56 +257,87 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
       <div className="flex flex-col space-y-3 sm:flex-row sm:items-center sm:justify-between sm:space-y-0 border-b border-zinc-200 dark:border-zinc-800 pb-4">
         <div>
           <h3 className="font-sans text-base font-bold text-zinc-900 dark:text-white flex items-center gap-2">
-            Precision Environmental Telemetry Graph
-            <span className="rounded bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 font-mono text-[10px] text-zinc-600 dark:text-zinc-400 uppercase">
-              Auto-Fitted Scale
+            Real Telemetry History Graph
+            <span className="rounded bg-emerald-500/10 px-2 py-0.5 font-mono text-[10px] text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 uppercase">
+              {history.length} Live Readings Recorded
             </span>
           </h3>
-          <p className="text-xs text-zinc-500 dark:text-zinc-400">Live ESP32 hardware time-series signal analysis</p>
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">Recorded from ESP32 hardware & stored in Supabase / LocalStorage</p>
         </div>
 
-        {/* Tab Switches */}
-        <div className="flex items-center rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 p-1 text-xs">
-          <button
-            onClick={() => setActiveTab('all')}
-            className={`rounded-lg px-2.5 py-1 font-medium transition ${
-              activeTab === 'all'
-                ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm'
-                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
-            }`}
-          >
-            All Graphs
-          </button>
-          <button
-            onClick={() => setActiveTab('temp')}
-            className={`rounded-lg px-2.5 py-1 font-medium transition ${
-              activeTab === 'temp'
-                ? 'bg-white dark:bg-zinc-800 text-orange-600 dark:text-orange-400 shadow-sm'
-                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
-            }`}
-          >
-            Temp
-          </button>
-          <button
-            onClick={() => setActiveTab('gas')}
-            className={`rounded-lg px-2.5 py-1 font-medium transition ${
-              activeTab === 'gas'
-                ? 'bg-white dark:bg-zinc-800 text-amber-600 dark:text-amber-400 shadow-sm'
-                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
-            }`}
-          >
-            Gas Level
-          </button>
-          <button
-            onClick={() => setActiveTab('humidity')}
-            className={`rounded-lg px-2.5 py-1 font-medium transition ${
-              activeTab === 'humidity'
-                ? 'bg-white dark:bg-zinc-800 text-cyan-600 dark:text-cyan-400 shadow-sm'
-                : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
-            }`}
-          >
-            Humidity
-          </button>
+        {/* Controls: Tab Switches & Zoom Mode Toggle */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Zoom Fit Mode Switch */}
+          <div className="flex items-center rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 p-1 text-xs">
+            <button
+              onClick={() => setZoomMode('auto')}
+              className={`flex items-center space-x-1 rounded-lg px-2 py-1 font-medium transition ${
+                zoomMode === 'auto'
+                  ? 'bg-white dark:bg-zinc-800 text-emerald-600 dark:text-emerald-400 shadow-sm font-bold'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+              title="Tight Auto-Zoom to reveal micro-fluctuations"
+            >
+              <ZoomIn className="h-3 w-3" />
+              <span>Auto-Fit Scale</span>
+            </button>
+            <button
+              onClick={() => setZoomMode('full')}
+              className={`flex items-center space-x-1 rounded-lg px-2 py-1 font-medium transition ${
+                zoomMode === 'full'
+                  ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm font-bold'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+              title="Full Range Scale with Threshold Limits"
+            >
+              <Maximize className="h-3 w-3" />
+              <span>Full Scale</span>
+            </button>
+          </div>
+
+          {/* Graph Filter Tabs */}
+          <div className="flex items-center rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-900 p-1 text-xs">
+            <button
+              onClick={() => setActiveTab('all')}
+              className={`rounded-lg px-2.5 py-1 font-medium transition ${
+                activeTab === 'all'
+                  ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+            >
+              All Signals
+            </button>
+            <button
+              onClick={() => setActiveTab('temp')}
+              className={`rounded-lg px-2.5 py-1 font-medium transition ${
+                activeTab === 'temp'
+                  ? 'bg-white dark:bg-zinc-800 text-orange-600 dark:text-orange-400 shadow-sm'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+            >
+              Temp
+            </button>
+            <button
+              onClick={() => setActiveTab('gas')}
+              className={`rounded-lg px-2.5 py-1 font-medium transition ${
+                activeTab === 'gas'
+                  ? 'bg-white dark:bg-zinc-800 text-amber-600 dark:text-amber-400 shadow-sm'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+            >
+              Gas
+            </button>
+            <button
+              onClick={() => setActiveTab('humidity')}
+              className={`rounded-lg px-2.5 py-1 font-medium transition ${
+                activeTab === 'humidity'
+                  ? 'bg-white dark:bg-zinc-800 text-cyan-600 dark:text-cyan-400 shadow-sm'
+                  : 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+              }`}
+            >
+              Humidity
+            </button>
+          </div>
         </div>
       </div>
 
@@ -321,11 +363,11 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
           <div>
             <div className="flex items-center justify-between mb-2">
               <span className="text-xs font-mono font-semibold text-orange-600 dark:text-orange-400 flex items-center gap-1.5">
-                <Thermometer className="h-3.5 w-3.5" /> Temperature Signal (°C)
+                <Thermometer className="h-3.5 w-3.5" /> Temperature Signal Curve (°C)
               </span>
               <span className="text-[10px] font-mono text-zinc-500">Combustion Threshold: 45.0°C</span>
             </div>
-            {renderSVGChart('temp', '#f97316', '°C', 45.0, 'Fire Hazard Threshold: 45°C')}
+            {renderSVGChart('temp', '#f97316', '°C', 45.0, 'Fire Hazard: 45°C')}
           </div>
         )}
 
@@ -333,11 +375,11 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
           <div>
             <div className="flex items-center justify-between mb-2">
               <span className="text-xs font-mono font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
-                <Wind className="h-3.5 w-3.5" /> Gas Concentration Signal (PPM)
+                <Wind className="h-3.5 w-3.5" /> Gas Concentration Signal Curve (PPM)
               </span>
               <span className="text-[10px] font-mono text-zinc-500">Elevated Gas Threshold: 400 PPM</span>
             </div>
-            {renderSVGChart('gas', '#f59e0b', ' PPM', 400, 'Gas Hazard Threshold: 400 PPM')}
+            {renderSVGChart('gas', '#f59e0b', ' PPM', 400, 'Gas Hazard: 400 PPM')}
           </div>
         )}
 
@@ -349,7 +391,7 @@ export const AnalyticsDashboard: React.FC<AnalyticsDashboardProps> = ({ currentM
               </span>
               <span className="text-[10px] font-mono text-zinc-500">Dampness Threshold: 75%</span>
             </div>
-            {renderSVGChart('humidity', '#06b6d4', '%', 75, 'High Humidity Threshold: 75%')}
+            {renderSVGChart('humidity', '#06b6d4', '%', 75, 'High Humidity: 75%')}
           </div>
         )}
       </div>
